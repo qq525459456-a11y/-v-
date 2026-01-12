@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Clow Cards - Magic Reveal</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Microsoft YaHei', sans-serif; user-select: none; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; pointer-events: none; }
+        
+        .panel { pointer-events: auto; background: rgba(0, 0, 0, 0.6); border: 1px solid #333; color: #fff; padding: 10px 20px; border-radius: 8px; backdrop-filter: blur(4px); }
+        
+        #status-panel { position: absolute; top: 20px; left: 20px; width: 340px; }
+        #controls { position: absolute; top: 20px; right: 20px; text-align: right; }
+        
+        button { pointer-events: auto; background: #333; color: #fff; border: 1px solid #555; padding: 8px 16px; margin-top: 5px; border-radius: 4px; cursor: pointer; transition: 0.2s;}
+        button:hover { background: #d4af37; color: #000; border-color: #d4af37; box-shadow: 0 0 10px #d4af37; }
+
+        #history-panel { position: absolute; bottom: 20px; left: 20px; width: 300px; max-height: 200px; overflow-y: auto; }
+        #history-list { list-style: none; padding: 0; margin: 0; }
+        #history-list li { border-bottom: 1px solid #333; padding: 5px 0; font-size: 14px; color: #ccc; display:flex; justify-content:space-between; }
+
+        #gesture-hint { font-size: 24px; font-weight: bold; color: #d4af37; margin-top: 10px; min-height: 32px; text-shadow: 0 0 15px rgba(212, 175, 55, 0.6); transition: all 0.2s; }
+        
+        #burn-progress-container { width: 100%; height: 6px; background: #222; margin-top: 10px; border-radius: 3px; overflow: hidden; opacity: 0; transition: opacity 0.3s; }
+        #burn-progress-bar { width: 0%; height: 100%; background: linear-gradient(90deg, #d4af37, #ffff00); box-shadow: 0 0 15px #d4af37; }
+
+        #loading { position: absolute; top:0; left:0; width:100%; height:100%; background:#000; color:#fff; display:flex; justify-content:center; align-items:center; z-index: 100; flex-direction: column; transition: opacity 0.5s; }
+
+        #debug-container {
+            position: absolute; bottom: 20px; right: 20px; 
+            width: 240px; height: 180px; 
+            background: #000; border: 2px solid #333; 
+            z-index: 20; display: none;
+            border-radius: 8px; overflow: hidden;
+        }
+        #input-video { position: absolute; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #output-canvas { position: absolute; width: 100%; height: 100%; transform: scaleX(-1); }
+        .debug-text { position: absolute; top: 0; left: 0; background: rgba(0,0,0,0.7); color: #fff; font-size: 12px; padding: 4px; width: 100%; font-weight: bold; z-index: 30;}
+    </style>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading"><h2>✨ 正在绘制魔法阵...</h2></div>
+
+    <div id="canvas-container"></div>
+
+    <div id="ui-layer">
+        <div id="status-panel" class="panel">
+            <div style="font-size:12px; color:#aaa;">法阵状态</div>
+            <div id="gesture-hint">等待操作...</div>
+            <div id="burn-progress-container">
+                <div id="burn-progress-bar"></div>
+            </div>
+            <div style="margin-top:5px; font-size:12px; color:#888;">
+                👋 张手滑动: 转动法阵 | ✊ 握拳: 翻转解封
+            </div>
+        </div>
+
+        <div id="controls" class="panel">
+            <button id="toggle-mode-btn">📷 开启摄像头</button> <br>
+            <button id="reset-deck-btn">🔄 重置</button>
+        </div>
+
+        <div id="history-panel" class="panel">
+            <h3>💌 解封记录</h3>
+            <ul id="history-list"></ul>
+        </div>
+        
+        <div id="debug-container">
+            <video id="input-video" playsinline></video>
+            <canvas id="output-canvas"></canvas>
+            <div class="debug-text" id="debug-msg">摄像头关闭</div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- 文案库 ---
+        const TEXT_CONTENT = [
+            "程龙", "我爱你", "你个二傻子", "你在干嘛", 
+            "我又胖了", "起床了", "我饿了", "涨了", "困了"
+        ];
+
+        // --- 配置 ---
+        const CONFIG = {
+            cardCount: 9, 
+            cardWidth: 6.0,  
+            cardHeight: 11.0, // 更加修长的库洛牌比例
+            radius: 18,      
+            curveDepth: 8,   
+            swipeThreshold: 0.03, 
+            swipeCooldown: 800,
+            rotationSmoothness: 0.08, 
+            burnTime: 2.0, 
+        };
+
+        const STATE = {
+            mode: 'mouse',
+            deck: [],
+            currentIndex: 0,
+            targetRotation: 0, 
+            currentRotation: 0,
+            isZoomed: false,
+            handVelocityX: 0,
+            lastHandX: 0.5,
+            lastHandTime: 0,
+            lastSwipeTime: 0,
+            gesture: 'OPEN',
+            burnTimer: 0,
+            particles: []
+        };
+
+        // --- 场景 ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a000a); // 极深的紫黑色背景
+        
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+        camera.position.set(0, 1, 35); 
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.useLegacyLights = true; 
+        container.appendChild(renderer.domElement);
+
+        // --- 装饰性灯光 ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5); 
+        scene.add(ambientLight);
+        const rimLight = new THREE.PointLight(0xffaa00, 1.5, 60);
+        rimLight.position.set(0, 10, 20);
+        scene.add(rimLight);
+
+        // --- 星空 ---
+        let starField;
+        function createStarField() {
+            const geometry = new THREE.BufferGeometry();
+            const vertices = [];
+            for (let i = 0; i < 6000; i++) {
+                vertices.push(
+                    (Math.random() - 0.5) * 600,
+                    (Math.random() - 0.5) * 600,
+                    (Math.random() - 0.5) * 600
+                );
+            }
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            const material = new THREE.PointsMaterial({ color: 0xffffaa, size: 0.3, transparent: true, opacity: 0.7 });
+            starField = new THREE.Points(geometry, material);
+            scene.add(starField);
+        }
+        createStarField();
+
+        // --- 核心：程序化生成“库洛牌”纹理 (无需图片) ---
+        function createClowCardTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 900;
+            const ctx = canvas.getContext('2d');
+
+            // 1. 底色 (深红/酒红)
+            const grad = ctx.createLinearGradient(0,0,512,900);
+            grad.addColorStop(0, '#660000');
+            grad.addColorStop(0.5, '#440000');
+            grad.addColorStop(1, '#220000');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0,0,512,900);
+
+            // 2. 金色边框
+            ctx.strokeStyle = '#d4af37'; // 亮金色
+            ctx.lineWidth = 25;
+            ctx.strokeRect(25, 25, 462, 850);
+            
+            ctx.lineWidth = 5;
+            ctx.strokeRect(45, 45, 422, 810);
+
+            // 3. 魔法阵图案 (简单的几何图形模拟)
+            ctx.translate(256, 450); // 移动到中心
+            
+            // 太阳光芒
+            ctx.fillStyle = '#aa8800';
+            for(let i=0; i<12; i++) {
+                ctx.beginPath();
+                ctx.moveTo(0, -150);
+                ctx.lineTo(30, -300);
+                ctx.lineTo(-30, -300);
+                ctx.fill();
+                ctx.rotate(Math.PI * 2 / 12);
+            }
+
+            // 内圆
+            ctx.strokeStyle = '#d4af37';
+            ctx.lineWidth = 15;
+            ctx.beginPath();
+            ctx.arc(0, 0, 150, 0, Math.PI*2);
+            ctx.stroke();
+            
+            // 月亮/翅膀抽象
+            ctx.beginPath();
+            ctx.arc(0, 0, 120, 0, Math.PI*2);
+            ctx.fillStyle = '#330000';
+            ctx.fill();
+
+            // 装饰文字 CLOW
+            ctx.font = 'bold 60px serif';
+            ctx.fillStyle = '#d4af37';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText("CLOW", 0, 0);
+
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            return tex;
+        }
+
+        // --- 生成背面文字纹理 ---
+        function createTextTexture(text) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 900;
+            const ctx = canvas.getContext('2d');
+
+            // 1. 米白色卡纸背景
+            const grad = ctx.createLinearGradient(0,0,512,900);
+            grad.addColorStop(0, '#fffdf0');
+            grad.addColorStop(1, '#f0e6d2');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0,0,512,900);
+
+            // 2. 边框
+            ctx.strokeStyle = '#d4af37';
+            ctx.lineWidth = 20;
+            ctx.strokeRect(20,20,472,860);
+
+            // 3. 文字
+            ctx.fillStyle = '#440000'; // 深褐色文字
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            
+            const fontSize = text.length > 3 ? 100 : 160;
+            ctx.font = `bold ${fontSize}px "Microsoft YaHei", serif`;
+            
+            // 加上一点发光效果
+            ctx.shadowColor = "#d4af37";
+            ctx.shadowBlur = 10;
+            ctx.fillText(text, 256, 450);
+            
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            return tex;
+        }
+
+        // --- 卡片类 ---
+        class Card {
+            constructor(text, index, totalCount) {
+                this.text = text;
+                this.index = index;
+                this.isActive = true; 
+                
+                const geometry = new THREE.BoxGeometry(CONFIG.cardWidth, CONFIG.cardHeight, 0.15);
+                const sideMat = new THREE.MeshBasicMaterial({ color: 0xaa8800 }); // 金色侧边
+                
+                // 1. 正面：库洛牌封面 (生成一次，大家共用，节省性能)
+                if (!window.clowTexture) window.clowTexture = createClowCardTexture();
+                const frontTex = window.clowTexture;
+                
+                // 2. 背面：定制文字
+                const backTex = createTextTexture(text);
+                
+                // 材质设置：BasicMaterial 自发光
+                const frontMat = new THREE.MeshBasicMaterial({ map: frontTex, color: 0xffffff });
+                const backMat = new THREE.MeshBasicMaterial({ map: backTex, color: 0xffffff });
+
+                // 重点：BoxGeometry 的面索引
+                // 4: +Z (前) -> 放库洛牌封面
+                // 5: -Z (后) -> 放文字
+                this.mesh = new THREE.Mesh(geometry, [sideMat, sideMat, sideMat, sideMat, frontMat, backMat]);
+                
+                this.baseAngle = (index / totalCount) * Math.PI * 2;
+                scene.add(this.mesh);
+            }
+
+            update(dt, time) {
+                if (!this.isActive) return;
+                const isSelected = (this.index === STATE.currentIndex);
+
+                // 亮度/选中高亮 (仅处理封面，文字面永远保持高亮)
+                const targetColor = new THREE.Color(isSelected ? 0xffffff : 0x666666);
+                this.mesh.material[4].color.lerp(targetColor, 0.1);
+
+                if (STATE.isZoomed && isSelected) {
+                    // --- 握拳状态：飞到眼前 + 翻转 ---
+                    const targetPos = new THREE.Vector3(0, 0, 25); 
+                    
+                    if (STATE.gesture === 'FIST') {
+                        targetPos.x += (Math.random()-0.5) * 0.15 * STATE.burnTimer;
+                        targetPos.y += (Math.random()-0.5) * 0.15 * STATE.burnTimer;
+                        if(Math.random() > 0.85) createMagicDust(this.mesh);
+                    }
+
+                    this.mesh.position.lerp(targetPos, 0.1);
+                    
+                    // 翻转逻辑：
+                    // 平时：Rotation Y = 0 (显示+Z封面)
+                    // 放大：Rotation Y = Math.PI (显示-Z背面的字)
+                    this.mesh.rotation.x = THREE.MathUtils.lerp(this.mesh.rotation.x, 0, 0.1);
+                    this.mesh.rotation.y = THREE.MathUtils.lerp(this.mesh.rotation.y, Math.PI, 0.1); 
+                    this.mesh.rotation.z = THREE.MathUtils.lerp(this.mesh.rotation.z, 0, 0.1);
+                    
+                    this.mesh.scale.setScalar(1.2); 
+
+                } else {
+                    // --- 环幕状态：封面朝外 ---
+                    let currentAngle = (this.baseAngle + STATE.currentRotation);
+                    let angleDist = Math.atan2(Math.sin(currentAngle), Math.cos(currentAngle));
+                    let absDist = Math.abs(angleDist);
+
+                    const x = Math.sin(currentAngle) * CONFIG.radius * 1.3; 
+                    let z = Math.cos(currentAngle) * CONFIG.radius - CONFIG.radius; 
+                    z -= Math.pow(absDist, 2) * CONFIG.curveDepth; 
+                    const y = Math.sin(time * 0.5 + this.index) * 0.3;
+
+                    let targetPos = new THREE.Vector3(x, y, z);
+                    
+                    let targetScale = Math.max(0.6, 1 - Math.pow(absDist / Math.PI, 1.5) * 0.8);
+                    
+                    if (STATE.isZoomed) {
+                        targetPos.multiplyScalar(1.8); 
+                        targetPos.z -= 20;
+                    }
+                    
+                    this.mesh.position.lerp(targetPos, 0.1);
+                    
+                    // 始终正对摄像机
+                    this.mesh.lookAt(0, y, 50);
+                    // 因为我们希望平时看到的是 +Z(封面)，而lookAt会让+Z对准目标
+                    // 所以不需要额外旋转，现在看到的就是封面
+                    
+                    this.mesh.scale.setScalar(targetScale);
+                }
+            }
+
+            burn() {
+                createExplosion(this.mesh);
+                // 这里我们不销毁，而是把它重置，或者仅隐藏一会
+                // 为了演示效果，我们让它变成粒子消失，然后提示完成
+                this.mesh.visible = false;
+                this.isActive = false;
+            }
+        }
+
+        // --- 粒子 ---
+        function createMagicDust(mesh) {
+            const count = 5;
+            const geo = new THREE.BufferGeometry();
+            const pos = [];
+            const worldPos = new THREE.Vector3();
+            mesh.getWorldPosition(worldPos);
+            for(let i=0; i<count; i++) {
+                pos.push(
+                    worldPos.x + (Math.random()-0.5) * CONFIG.cardWidth,
+                    worldPos.y + (Math.random()-0.5) * CONFIG.cardHeight,
+                    worldPos.z + 0.2
+                );
+            }
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+            const mat = new THREE.PointsMaterial({ color: 0xffffaa, size: 0.2, transparent: true, blending: THREE.AdditiveBlending });
+            const p = new THREE.Points(geo, mat);
+            scene.add(p);
+            STATE.particles.push({ mesh: p, life: 1.0, vel: new THREE.Vector3(0, 0.05, 0) });
+        }
+
+        function createExplosion(mesh) {
+            const count = 1000;
+            const geo = new THREE.BufferGeometry();
+            const pos = [], vels = [];
+            const worldPos = new THREE.Vector3();
+            mesh.getWorldPosition(worldPos);
+            for(let i=0; i<count; i++) {
+                pos.push(worldPos.x + (Math.random()-0.5)*4, worldPos.y + (Math.random()-0.5)*8, worldPos.z);
+                vels.push({ x: (Math.random()-0.5)*0.5, y: (Math.random()-0.5)*0.5, z: (Math.random()-0.5)*0.5 });
+            }
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+            const mat = new THREE.PointsMaterial({ color: 0xffaa00, size: 0.3, transparent: true, blending: THREE.AdditiveBlending });
+            const p = new THREE.Points(geo, mat);
+            scene.add(p);
+            STATE.particles.push({ mesh: p, life: 2.0, isExplosion: true, vels: vels });
+        }
+
+        function updateParticles() {
+            for (let i = STATE.particles.length - 1; i >= 0; i--) {
+                const p = STATE.particles[i]; p.life -= 0.02;
+                if (p.isExplosion) {
+                    const positions = p.mesh.geometry.attributes.position.array;
+                    for(let j=0; j<p.vels.length; j++) {
+                        positions[j*3] += p.vels[j].x; positions[j*3+1] += p.vels[j].y; positions[j*3+2] += p.vels[j].z;
+                    }
+                    p.mesh.geometry.attributes.position.needsUpdate = true;
+                } else { p.mesh.position.add(p.vel); }
+                p.mesh.material.opacity = p.life;
+                if (p.life <= 0) { scene.remove(p.mesh); STATE.particles.splice(i, 1); }
+            }
+        }
+
+        // --- 逻辑 ---
+        function initDeck() {
+            STATE.deck.forEach(c => scene.remove(c.mesh));
+            STATE.deck = [];
+            STATE.currentIndex = 0;
+            STATE.targetRotation = 0;
+            STATE.currentRotation = 0;
+            STATE.isZoomed = false;
+            document.getElementById('history-list').innerHTML = '';
+            
+            for(let i=0; i<TEXT_CONTENT.length; i++) {
+                STATE.deck.push(new Card(TEXT_CONTENT[i], i, TEXT_CONTENT.length));
+            }
+            updateUI("✨ 封印解除");
+        }
+
+        function rotateCarousel(dir) {
+            const now = Date.now();
+            if (now - STATE.lastSwipeTime < CONFIG.swipeCooldown) return;
+            STATE.lastSwipeTime = now;
+
+            const count = STATE.deck.length;
+            if (count === 0) return;
+
+            STATE.currentIndex = (STATE.currentIndex + dir + count) % count;
+            const step = (Math.PI * 2) / count;
+            STATE.targetRotation -= dir * step; 
+            updateUI("💫 命运流转...");
+        }
+
+        function updateUI(text, progress = 0) {
+            const hint = document.getElementById('gesture-hint');
+            if (text) hint.innerText = text;
+            if (text.includes("!")) hint.style.color = "#ffffff";
+            else hint.style.color = "#d4af37";
+
+            const barContainer = document.getElementById('burn-progress-container');
+            const bar = document.getElementById('burn-progress-bar');
+            if (progress > 0) {
+                barContainer.style.opacity = 1;
+                bar.style.width = (progress * 100) + "%";
+            } else {
+                barContainer.style.opacity = 0;
+            }
+        }
+
+        function updateLogic(dt, time) {
+            STATE.currentRotation += (STATE.targetRotation - STATE.currentRotation) * CONFIG.rotationSmoothness;
+            
+            if(STATE.deck.length === 0) return;
+            const currentCard = STATE.deck[STATE.currentIndex];
+
+            if (STATE.gesture === 'FIST') {
+                if (!STATE.isZoomed) {
+                    STATE.isZoomed = true; 
+                    updateUI("✊ 正在解封...");
+                }
+                
+                STATE.burnTimer += dt;
+                const progress = Math.min(STATE.burnTimer / CONFIG.burnTime, 1.0);
+                updateUI(`🔥 揭示中... ${(CONFIG.burnTime - STATE.burnTimer).toFixed(1)}s`, progress);
+
+                if (STATE.burnTimer >= CONFIG.burnTime) {
+                    currentCard.burn();
+                    STATE.isZoomed = false;
+                    STATE.burnTimer = 0;
+                    updateUI("✅ " + currentCard.text);
+                    addHistory(currentCard.text);
+                    
+                    // 简单的移除逻辑：
+                    const idx = STATE.deck.indexOf(currentCard);
+                    if(idx > -1) STATE.deck.splice(idx, 1);
+                    if(STATE.deck.length > 0) {
+                         // 稍微修正下索引防止越界，但为了视觉平滑暂不重排
+                         STATE.currentIndex = STATE.currentIndex % STATE.deck.length;
+                    }
+                }
+            } else {
+                if (STATE.gesture === 'OPEN') {
+                    STATE.burnTimer = 0;
+                    if (STATE.isZoomed) {
+                        STATE.isZoomed = false; 
+                        updateUI("🖐 取消");
+                    } else if (STATE.mode === 'hand') {
+                        updateUI("🖐 张手滑动 / ✊ 握拳解封");
+                    }
+                }
+            }
+
+            if (STATE.mode === 'hand' && STATE.gesture === 'OPEN' && !STATE.isZoomed) {
+                if (Math.abs(STATE.handVelocityX) > CONFIG.swipeThreshold) {
+                    const dir = Math.sign(STATE.handVelocityX); 
+                    rotateCarousel(dir);
+                    STATE.handVelocityX = 0; 
+                }
+            }
+        }
+
+        function addHistory(text) {
+            const li = document.createElement('li');
+            li.innerHTML = `<span>"${text}"</span> <span>已揭晓</span>`;
+            document.getElementById('history-list').prepend(li);
+        }
+
+        // --- MediaPipe ---
+        let hands = null;
+        let isCameraRunning = false;
+        const videoElement = document.getElementById('input-video');
+        const canvasElement = document.getElementById('output-canvas');
+        const ctx = canvasElement.getContext('2d');
+        const debugMsg = document.getElementById('debug-msg');
+
+        async function setupCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } });
+                videoElement.srcObject = stream;
+                return new Promise((resolve) => { videoElement.onloadedmetadata = () => { videoElement.play(); resolve(); }; });
+            } catch (err) { alert("摄像头启动失败"); throw err; }
+        }
+
+        async function initHands() {
+            debugMsg.innerText = "加载中...";
+            hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+            hands.setOptions({maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5});
+            hands.onResults(onResults);
+        }
+
+        async function startCameraLoop() {
+            await setupCamera(); await initHands();
+            document.getElementById('debug-container').style.display = 'block';
+            isCameraRunning = true; processVideo();
+        }
+
+        async function processVideo() {
+            if (!isCameraRunning) return;
+            if (videoElement.readyState >= 2) await hands.send({image: videoElement});
+            requestAnimationFrame(processVideo);
+        }
+
+        function onResults(results) {
+            ctx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                debugMsg.innerText = "✅ 识别中"; debugMsg.style.color = "#00ff00";
+                const lm = results.multiHandLandmarks[0];
+                ctx.fillStyle = "#00ff00";
+                for (let i = 0; i < lm.length; i++) {
+                    ctx.beginPath(); ctx.arc(lm[i].x * canvasElement.width, lm[i].y * canvasElement.height, 3, 0, 2 * Math.PI); ctx.fill();
+                }
+                if (STATE.mode !== 'hand') return;
+                
+                const handX = (lm[0].x + lm[9].x) / 2; const now = Date.now();
+                if (STATE.lastHandTime !== 0) { const dt = now - STATE.lastHandTime; if (dt > 0) STATE.handVelocityX = handX - STATE.lastHandX; }
+                STATE.lastHandX = handX; STATE.lastHandTime = now;
+
+                const wrist = lm[0]; const tips = [8, 12, 16, 20]; let folded = 0;
+                tips.forEach(idx => { if (Math.hypot(lm[idx].x - wrist.x, lm[idx].y - wrist.y) < 0.25) folded++; });
+                
+                const isFist = folded >= 3;
+                if (isFist) STATE.gesture = 'FIST';
+                else STATE.gesture = 'OPEN';
+                
+            } else { debugMsg.innerText = "🔍 寻找手部..."; debugMsg.style.color = "orange"; }
+        }
+
+        document.getElementById('toggle-mode-btn').addEventListener('click', () => {
+            if (STATE.mode === 'mouse') {
+                STATE.mode = 'hand'; document.getElementById('toggle-mode-btn').innerText = "🖱️ 切换回鼠标"; startCameraLoop();
+            } else { location.reload(); }
+        });
+        document.getElementById('reset-deck-btn').addEventListener('click', initDeck);
+        window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+        
+        window.addEventListener('keydown', (e) => {
+            if (STATE.mode !== 'mouse') return;
+            if (e.key === 'ArrowLeft') rotateCarousel(1); if (e.key === 'ArrowRight') rotateCarousel(-1);
+            if (e.code === 'Space') { STATE.gesture = 'FIST'; }
+        });
+        window.addEventListener('keyup', (e) => { if (e.code === 'Space') { STATE.gesture = 'OPEN'; } });
+
+        setTimeout(() => document.getElementById('loading').style.display = 'none', 1000);
+
+        initDeck();
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta(); const time = clock.getElapsedTime();
+            if(starField) starField.rotation.y = time * 0.02;
+            try {
+                STATE.deck.forEach(c => c.update(dt, time));
+                updateLogic(dt, time); updateParticles(); renderer.render(scene, camera);
+            } catch (e) { console.error(e); }
+        }
+        animate();
+
+    </script>
+</body>
+</html>
